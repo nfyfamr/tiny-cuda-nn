@@ -117,6 +117,8 @@ GridType string_to_grid_type(const std::string& grid_type) {
 		return GridType::Dense;
 	} else if (equals_case_insensitive(grid_type, "Tiled") || equals_case_insensitive(grid_type, "Tile")) {
 		return GridType::Tiled;
+	} else if (equals_case_insensitive(grid_type, "MixedFeature")) {
+		return GridType::MixedFeature;
 	}
 
 	throw std::runtime_error{fmt::format("Invalid grid type: {}", grid_type)};
@@ -127,6 +129,7 @@ std::string to_string(GridType grid_type) {
 		case GridType::Hash: return "Hash";
 		case GridType::Dense: return "Dense";
 		case GridType::Tiled: return "Tiled";
+		case GridType::MixedFeature: return "MixedFeature";
 		default: throw std::runtime_error{"Invalid grid type."};
 	}
 }

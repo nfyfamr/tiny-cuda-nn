@@ -51,6 +51,7 @@ __global__ void kernel_grid(
 	const uint32_t num_grid_features,
 	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
+	const uint32_t levels_per_table,
 	const float log2_per_level_scale,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
@@ -91,8 +92,18 @@ __global__ void kernel_grid(
 		return;
 	}
 
-	grid += offset_table.data[level] * N_FEATURES_PER_LEVEL;
-	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+	uint32_t hashmap_size;
+	float idx_transform = 1;
+	if (grid_type == GridType::MixedFeature) {
+		const uint8_t idx_table = level / levels_per_table;
+		grid += offset_table.data[idx_table] * N_FEATURES_PER_LEVEL;
+		hashmap_size = offset_table.data[idx_table + 1] - offset_table.data[idx_table];
+
+		idx_transform = exp2f((levels_per_table - (level % levels_per_table) - 1) * log2_per_level_scale);
+	} else {
+		grid += offset_table.data[level] * N_FEATURES_PER_LEVEL;
+		hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+	}
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
 	const uint32_t resolution = grid_resolution(scale);
@@ -152,10 +163,10 @@ __global__ void kernel_grid(
 			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
 				if ((idx & (1<<dim)) == 0) {
 					weight *= 1 - pos[dim];
-					pos_grid_local[dim] = pos_grid[dim];
+					pos_grid_local[dim] = pos_grid[dim] * idx_transform;
 				} else {
 					weight *= pos[dim];
-					pos_grid_local[dim] = pos_grid[dim] + 1;
+					pos_grid_local[dim] = (pos_grid[dim] + 1) * idx_transform;
 				}
 			}
 
@@ -185,16 +196,16 @@ __global__ void kernel_grid(
 
 					if ((idx & (1<<non_grad_dim)) == 0) {
 						weight *= 1 - pos[dim];
-						pos_grid_local[dim] = pos_grid[dim];
+						pos_grid_local[dim] = pos_grid[dim] * idx_transform;
 					} else {
 						weight *= pos[dim];
-						pos_grid_local[dim] = pos_grid[dim] + 1;
+						pos_grid_local[dim] = (pos_grid[dim] + 1) * idx_transform;
 					}
 				}
 
-				pos_grid_local[grad_dim] = pos_grid[grad_dim];
+				pos_grid_local[grad_dim] = pos_grid[grad_dim] * idx_transform;
 				auto val_left = grid_val(pos_grid_local);
-				pos_grid_local[grad_dim] = pos_grid[grad_dim] + 1;
+				pos_grid_local[grad_dim] = (pos_grid[grad_dim] + 1) * idx_transform;
 				auto val_right = grid_val(pos_grid_local);
 
 				TCNN_PRAGMA_UNROLL
@@ -217,6 +228,7 @@ __global__ void kernel_grid_backward(
 	const uint32_t num_grid_features,
 	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
+	const uint32_t levels_per_table,
 	const float log2_per_level_scale,
 	float max_level,
 	const float* __restrict__ max_level_gpu,
@@ -243,8 +255,18 @@ __global__ void kernel_grid_backward(
 		return;
 	}
 
-	grid_gradient += offset_table.data[level] * N_FEATURES_PER_LEVEL;
-	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+	uint32_t hashmap_size;
+	float idx_transform = 1;
+	if (grid_type == GridType::MixedFeature) {
+		const uint8_t idx_table = level / levels_per_table;
+		grid_gradient += offset_table.data[idx_table] * N_FEATURES_PER_LEVEL;
+		hashmap_size = offset_table.data[idx_table + 1] - offset_table.data[idx_table];
+
+		idx_transform = exp2f((levels_per_table - (level % levels_per_table) - 1) * log2_per_level_scale);
+	} else {
+		grid_gradient += offset_table.data[level] * N_FEATURES_PER_LEVEL;
+		hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+	}
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
 	const uint32_t resolution = grid_resolution(scale);
@@ -308,10 +330,10 @@ __global__ void kernel_grid_backward(
 		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
 			if ((idx & (1<<dim)) == 0) {
 				weight *= 1 - pos[dim];
-				pos_grid_local[dim] = pos_grid[dim];
+				pos_grid_local[dim] = pos_grid[dim] * idx_transform;
 			} else {
 				weight *= pos[dim];
-				pos_grid_local[dim] = pos_grid[dim] + 1;
+				pos_grid_local[dim] = (pos_grid[dim] + 1) * idx_transform;
 			}
 		}
 
@@ -670,6 +692,7 @@ public:
 		uint32_t log2_hashmap_size,
 		uint32_t base_resolution,
 		float per_level_scale,
+		uint32_t n_tables,
 		bool stochastic_interpolation,
 		InterpolationType interpolation_type,
 		GridType grid_type
@@ -678,6 +701,7 @@ public:
 	m_log2_hashmap_size{log2_hashmap_size},
 	m_base_resolution{base_resolution},
 	m_per_level_scale{per_level_scale},
+	m_n_tables{n_tables},
 	m_stochastic_interpolation{stochastic_interpolation},
 	m_interpolation_type{interpolation_type},
 	m_grid_type{grid_type}
@@ -707,20 +731,44 @@ public:
 			} else if (grid_type == GridType::Hash) {
 				// If hash table needs fewer params than dense, then use fewer and rely on the hash.
 				params_in_level = std::min(params_in_level, (1u << log2_hashmap_size));
+			} else if (grid_type == GridType::MixedFeature) {
+				params_in_level = std::min(params_in_level, (1u << log2_hashmap_size));
 			} else {
 				throw std::runtime_error{fmt::format("GridEncoding: invalid grid type {}", to_string(grid_type))};
 			}
 
-			m_offset_table.data[i] = offset;
-			offset += params_in_level;
+			uint32_t levels_per_table = 1;
+			if (grid_type == GridType::MixedFeature) {
+				levels_per_table = m_n_levels / m_n_tables;
+				const uint32_t idx_table = i / levels_per_table;
 
-			log_debug("GridEncoding at level {}: resolution={} params_in_level={}", i, resolution, params_in_level);
+				if ((i+1) % levels_per_table == 0) {
+					m_offset_table.data[idx_table] = offset;
+					offset += params_in_level;
+				}
+			} else {
+				m_offset_table.data[i] = offset;
+				offset += params_in_level;
+			}
+
+			if (grid_type == GridType::MixedFeature) {
+				log_debug("MultiWindowGridEncoding at level {}: resolution={} (idx_table {}) params_in_level={}", i, resolution, (i / levels_per_table), params_in_level);
+			} else {
+				log_debug("GridEncoding at level {}: resolution={} params_in_level={}", i, resolution, params_in_level);
+			}
 		}
 
-		m_offset_table.data[m_n_levels] = offset;
-		m_offset_table.size = m_n_levels+1;
+		if (grid_type == GridType::MixedFeature) {
+			m_offset_table.data[m_n_tables] = offset;
+			m_offset_table.size = m_n_tables+1;
 
-		m_n_params = m_offset_table.data[m_n_levels] * N_FEATURES_PER_LEVEL;
+			m_n_params = m_offset_table.data[m_n_tables] * N_FEATURES_PER_LEVEL;
+		} else {
+			m_offset_table.data[m_n_levels] = offset;
+			m_offset_table.size = m_n_levels+1;
+
+			m_n_params = m_offset_table.data[m_n_levels] * N_FEATURES_PER_LEVEL;
+		}
 
 		m_n_output_dims = m_n_features;
 
@@ -776,11 +824,14 @@ public:
 			forward->dy_dx = GPUMatrix<float, RM>{N_POS_DIMS * m_n_features, input.n(), synced_streams.get(0)};
 		}
 
+		const uint32_t levels_per_table = m_n_levels / m_n_tables;
+
 		kernel_grid<T, N_POS_DIMS, N_FEATURES_PER_LEVEL, HASH_TYPE><<<blocks_hashgrid, N_THREADS_HASHGRID, 0, synced_streams.get(0)>>>(
 			num_elements,
 			m_n_features,
 			m_offset_table,
 			m_base_resolution,
+			levels_per_table,
 			std::log2(m_per_level_scale),
 			this->m_max_level,
 			this->m_max_level_gpu,
@@ -862,12 +913,14 @@ public:
 			static constexpr uint32_t N_FEATURES_PER_THREAD = std::min(2u, N_FEATURES_PER_LEVEL);
 
 			const dim3 blocks_hashgrid = { div_round_up(num_elements * N_FEATURES_PER_LEVEL / N_FEATURES_PER_THREAD, N_THREADS_HASHGRID), m_n_levels, 1 };
+			const uint32_t levels_per_table = m_n_levels / m_n_tables;
 
 			kernel_grid_backward<T, grad_t, N_POS_DIMS, N_FEATURES_PER_LEVEL, N_FEATURES_PER_THREAD, HASH_TYPE><<<blocks_hashgrid, N_THREADS_HASHGRID, 0, stream>>>(
 				num_elements,
 				m_n_features,
 				m_offset_table,
 				m_base_resolution,
+				levels_per_table,
 				std::log2(m_per_level_scale),
 				this->m_max_level,
 				this->m_max_level_gpu,
@@ -1107,8 +1160,9 @@ public:
 			{"hash", to_string(HASH_TYPE)},
 		};
 
-		if (m_grid_type == GridType::Hash) {
+		if (m_grid_type == GridType::Hash || m_grid_type == GridType::MixedFeature) {
 			result["log2_hashmap_size"] = m_log2_hashmap_size;
+			result["n_tables"] = m_n_tables;
 		}
 
 		return result;
@@ -1122,6 +1176,7 @@ private:
 
 	uint32_t m_n_features;
 	uint32_t m_n_levels;
+	uint32_t m_n_tables;
 	uint32_t m_n_params;
 	GridOffsetTable m_offset_table;
 	uint32_t m_log2_hashmap_size;
@@ -1144,7 +1199,7 @@ template <typename T, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding) {
 	const uint32_t log2_hashmap_size = encoding.value("log2_hashmap_size", 19u);
 	const std::string encoding_type = encoding.value("otype", "Grid");
-	const std::string default_type = equals_case_insensitive(encoding_type, "TiledGrid") ? "Tiled" : (equals_case_insensitive(encoding_type, "DenseGrid") ? "Dense" : "Hash");
+	const std::string default_type = equals_case_insensitive(encoding_type, "TiledGrid") ? "Tiled" : (equals_case_insensitive(encoding_type, "DenseGrid") ? "Dense" : (equals_case_insensitive(encoding_type, "MixedFeatureGrid") ? "MixedFeature" : "Hash"));
 
 	uint32_t n_features;
 	if (encoding.contains("n_features") || encoding.contains("n_grid_features")) {
@@ -1165,6 +1220,7 @@ GridEncoding<T>* create_grid_encoding_templated_2(uint32_t n_dims_to_encode, con
 	log2_hashmap_size, \
 	base_resolution, \
 	encoding.value("per_level_scale", grid_type == GridType::Dense ? std::exp(std::log(256.0f / (float)base_resolution) / (n_levels-1)) : 2.0f), \
+	encoding.value("n_tables", 1u), \
 	encoding.value("stochastic_interpolation", false), \
 	string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
 	grid_type, \

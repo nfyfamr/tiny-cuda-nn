@@ -139,6 +139,7 @@ enum class GridType {
 	Hash,
 	Dense,
 	Tiled,
+	MixedFeature,
 };
 
 enum class HashType {

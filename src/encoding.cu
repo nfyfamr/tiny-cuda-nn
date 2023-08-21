@@ -73,6 +73,7 @@ auto register_builtin_encodings() {
 	register_encoding<T>(factories, "HashGrid", grid_factory);
 	register_encoding<T>(factories, "TiledGrid", grid_factory);
 	register_encoding<T>(factories, "DenseGrid", grid_factory);
+	register_encoding<T>(factories, "MixedFeatureGrid", grid_factory);
 
 	register_encoding<T>(factories, "Identity", [](uint32_t n_dims_to_encode, const json& encoding) {
 		return new IdentityEncoding<T>{n_dims_to_encode, encoding.value("scale", 1.0f), encoding.value("offset", 0.0f)};
